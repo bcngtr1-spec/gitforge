@@ -5,6 +5,7 @@ const JSON_TYPE = 'application/json; charset=utf-8';
 const DEFAULT_OWNER = process.env.MAKEFUN_SHOP_USER || 'owner';
 
 interface RepoStore {
+  id: number;
   owner: string;
   name: string;
   private: boolean;
@@ -23,7 +24,7 @@ interface RepoStore {
     labels: string[];
     createdAt: number;
     id: string;
-    comments: Array<{ id: number; body: string }>;
+    comments: Array<{ id: number; body: string; createdAt: number }>;
   }>;
   pulls: Map<number, {
     number: number;
@@ -36,12 +37,14 @@ interface RepoStore {
     base: { ref: string; sha: string };
     id: string;
     mergeCommitSha?: string;
+    createdAt: number;
   }>;
   nextIssueNumber: number;
   nextPullNumber: number;
 }
 
 const repos = new Map<string, RepoStore>();
+let nextRepoId = 101;
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
   const text = `${JSON.stringify(body)}\n`;
@@ -116,6 +119,73 @@ function hashString(str: string): string {
 
 function globalId(type: string, id: string | number): string {
   return Buffer.from(`${type}:${id}`).toString('base64');
+}
+
+function parseGlobalId(globalIdStr: string): { type: string; id: string | number } | null {
+  try {
+    const decoded = Buffer.from(globalIdStr, 'base64').toString('utf8');
+    const idx = decoded.indexOf(':');
+    if (idx === -1) return null;
+    return { type: decoded.slice(0, idx), id: decoded.slice(idx + 1) };
+  } catch {
+    return null;
+  }
+}
+
+function formatRepo(r: RepoStore) {
+  return {
+    id: r.id,
+    node_id: globalId('Repository', r.name),
+    name: r.name,
+    full_name: `${r.owner}/${r.name}`,
+    private: r.private,
+    description: r.description,
+    default_branch: r.default_branch,
+    owner: { login: r.owner, id: 1, type: 'User' },
+    created_at: new Date(r.createdAt).toISOString(),
+    updated_at: new Date(r.createdAt).toISOString(),
+    permissions: { admin: true, push: true, pull: true },
+    has_issues: true,
+    has_downloads: true,
+    has_wiki: true,
+    has_pages: false,
+    viewerPermission: 'ADMIN',
+    hasIssuesEnabled: true,
+  };
+}
+
+function formatIssue(i: RepoStore['issues'] extends Map<number, infer U> ? U : never, repo: RepoStore) {
+  return {
+    id: i.id,
+    node_id: i.id,
+    number: i.number,
+    title: i.title,
+    body: i.body,
+    state: i.state,
+    labels: i.labels.map(l => ({ name: typeof l === 'string' ? l : (l as any).name, color: 'ededed' })),
+    created_at: new Date(i.createdAt).toISOString(),
+    updated_at: new Date(i.createdAt).toISOString(),
+    user: { login: repo.owner },
+  };
+}
+
+function formatPull(p: RepoStore['pulls'] extends Map<number, infer U> ? U : never, repo: RepoStore) {
+  return {
+    id: p.id,
+    node_id: p.id,
+    number: p.number,
+    state: p.state,
+    title: p.title,
+    body: p.body,
+    merged: p.merged,
+    merged_at: p.mergedAt,
+    merge_commit_sha: p.mergeCommitSha,
+    head: p.head,
+    base: p.base,
+    created_at: new Date(p.createdAt).toISOString(),
+    updated_at: new Date(p.createdAt).toISOString(),
+    user: { login: repo.owner },
+  };
 }
 
 export function createApp(): Server {
@@ -206,7 +276,7 @@ export function createApp(): Server {
       }
 
       if (path === '/api/v3/user') {
-        sendJson(res, 200, { login: DEFAULT_OWNER, id: 1, type: 'User' });
+        sendJson(res, 200, { login: DEFAULT_OWNER, id: 1, type: 'User', name: DEFAULT_OWNER });
         return;
       }
 
@@ -216,15 +286,7 @@ export function createApp(): Server {
         const userRepos: any[] = [];
         for (const r of repos.values()) {
           if (r.owner === DEFAULT_OWNER) {
-            userRepos.push({
-              id: hashString(r.name),
-              name: r.name,
-              full_name: `${r.owner}/${r.name}`,
-              private: r.private,
-              description: r.description,
-              default_branch: r.default_branch,
-              owner: { login: r.owner },
-            });
+            userRepos.push(formatRepo(r));
           }
         }
         const start = (page - 1) * perPage;
@@ -255,20 +317,12 @@ export function createApp(): Server {
         }
         const repoKey = `${DEFAULT_OWNER}/${name}`.toLowerCase();
         if (repos.has(repoKey)) {
-          // If already exists, return 201 or 422 / 409 depending on suite, but tests accept 201 or 422. Let's return existing or 201.
           const r = repos.get(repoKey)!;
-          sendJson(res, 201, {
-            id: hashString(r.name),
-            name: r.name,
-            full_name: `${r.owner}/${r.name}`,
-            private: r.private,
-            description: r.description,
-            default_branch: r.default_branch,
-            owner: { login: r.owner },
-          });
+          sendJson(res, 201, formatRepo(r));
           return;
         }
         const store: RepoStore = {
+          id: nextRepoId++,
           owner: DEFAULT_OWNER,
           name,
           private: body.private ?? true,
@@ -285,15 +339,7 @@ export function createApp(): Server {
           nextPullNumber: 1,
         };
         repos.set(repoKey, store);
-        sendJson(res, 201, {
-          id: hashString(store.name),
-          name: store.name,
-          full_name: `${store.owner}/${store.name}`,
-          private: store.private,
-          description: store.description,
-          default_branch: store.default_branch,
-          owner: { login: store.owner },
-        });
+        sendJson(res, 201, formatRepo(store));
         return;
       }
 
@@ -313,17 +359,7 @@ export function createApp(): Server {
 
         if (sub === '' || sub === '/') {
           if (method === 'GET') {
-            sendJson(res, 200, {
-              id: hashString(store.name),
-              name: store.name,
-              full_name: `${store.owner}/${store.name}`,
-              private: store.private,
-              description: store.description,
-              default_branch: store.default_branch,
-              owner: { login: store.owner },
-              hasIssuesEnabled: true,
-              viewerPermission: 'ADMIN',
-            });
+            sendJson(res, 200, formatRepo(store));
             return;
           }
           if (method === 'PATCH') {
@@ -335,15 +371,9 @@ export function createApp(): Server {
               return;
             }
             if (body.description !== undefined) store.description = body.description;
-            sendJson(res, 200, {
-              id: hashString(store.name),
-              name: store.name,
-              full_name: `${store.owner}/${store.name}`,
-              private: store.private,
-              description: store.description,
-              default_branch: store.default_branch,
-              owner: { login: store.owner },
-            });
+            if (body.private !== undefined) store.private = body.private;
+            if (body.default_branch !== undefined) store.default_branch = body.default_branch;
+            sendJson(res, 200, formatRepo(store));
             return;
           }
           if (method === 'DELETE') {
@@ -366,7 +396,14 @@ export function createApp(): Server {
         }
 
         if (sub === '/commits' && method === 'GET') {
-          sendJson(res, 200, store.commits.map(c => ({
+          const shaFilter = query.get('sha');
+          let commitsList = store.commits;
+          if (shaFilter) {
+            // Filter or return commits on branch
+            const branchSha = store.branches.get(shaFilter) || shaFilter;
+            commitsList = store.commits.filter(c => c.branch === shaFilter || c.sha === branchSha);
+          }
+          sendJson(res, 200, commitsList.map(c => ({
             sha: c.sha,
             commit: { message: c.message, author: { name: c.author } },
           })));
@@ -452,14 +489,7 @@ export function createApp(): Server {
             }
             return 0;
           });
-          sendJson(res, 200, filtered.map(i => ({
-            number: i.number,
-            title: i.title,
-            body: i.body,
-            state: i.state,
-            labels: i.labels.map(l => ({ name: l })),
-            id: i.id,
-          })));
+          sendJson(res, 200, filtered.map(i => formatIssue(i, store)));
           return;
         }
 
@@ -473,9 +503,10 @@ export function createApp(): Server {
           }
           const title = body.title;
           const issueBody = body.body || '';
-          const labelsInput: string[] = body.labels || [];
-          for (const lName of labelsInput) {
-            if (!store.labels.has(lName)) {
+          const labelsInput: any[] = body.labels || [];
+          for (const l of labelsInput) {
+            const lName = typeof l === 'string' ? l : (l?.name || '');
+            if (lName && !store.labels.has(lName)) {
               sendJson(res, 422, { message: `Label does not exist: ${lName}` });
               return;
             }
@@ -486,20 +517,13 @@ export function createApp(): Server {
             title,
             body: issueBody,
             state: 'open' as const,
-            labels: labelsInput,
+            labels: labelsInput.map(l => (typeof l === 'string' ? l : l.name)),
             createdAt: Date.now(),
             id: globalId('Issue', num),
             comments: [],
           };
           store.issues.set(num, issueObj);
-          sendJson(res, 201, {
-            number: num,
-            title,
-            body: issueBody,
-            state: 'open',
-            labels: labelsInput.map(l => ({ name: l })),
-            id: issueObj.id,
-          });
+          sendJson(res, 201, formatIssue(issueObj, store));
           return;
         }
 
@@ -516,14 +540,7 @@ export function createApp(): Server {
 
           if (issueSub === '' || issueSub === '/') {
             if (method === 'GET') {
-              sendJson(res, 200, {
-                number: issue.number,
-                title: issue.title,
-                body: issue.body,
-                state: issue.state,
-                labels: issue.labels.map(l => ({ name: l })),
-                id: issue.id,
-              });
+              sendJson(res, 200, formatIssue(issue, store));
               return;
             }
             if (method === 'PATCH') {
@@ -535,21 +552,14 @@ export function createApp(): Server {
                 return;
               }
               if (body.state) issue.state = body.state;
-              sendJson(res, 200, {
-                number: issue.number,
-                title: issue.title,
-                body: issue.body,
-                state: issue.state,
-                labels: issue.labels.map(l => ({ name: l })),
-                id: issue.id,
-              });
+              sendJson(res, 200, formatIssue(issue, store));
               return;
             }
           }
 
           if (issueSub === '/comments') {
             if (method === 'GET') {
-              sendJson(res, 200, issue.comments);
+              sendJson(res, 200, issue.comments.map(c => ({ id: c.id, body: c.body, created_at: new Date(c.createdAt).toISOString() })));
               return;
             }
             if (method === 'POST') {
@@ -561,9 +571,9 @@ export function createApp(): Server {
                 return;
               }
               const commentId = issue.comments.length + 1;
-              const comment = { id: commentId, body: body.body || '' };
+              const comment = { id: commentId, body: body.body || '', createdAt: Date.now() };
               issue.comments.push(comment);
-              sendJson(res, 201, comment);
+              sendJson(res, 201, { id: comment.id, body: comment.body, created_at: new Date(comment.createdAt).toISOString() });
               return;
             }
           }
@@ -577,16 +587,7 @@ export function createApp(): Server {
             if (stateFilter === 'open') return p.state === 'open';
             return p.state === stateFilter;
           });
-          sendJson(res, 200, filtered.map(p => ({
-            number: p.number,
-            title: p.title,
-            body: p.body,
-            state: p.state,
-            merged: p.merged,
-            head: p.head,
-            base: p.base,
-            id: p.id,
-          })));
+          sendJson(res, 200, filtered.map(p => formatPull(p, store)));
           return;
         }
 
@@ -614,18 +615,10 @@ export function createApp(): Server {
             head: { ref: headRef, sha: headSha },
             base: { ref: baseRef, sha: baseSha },
             id: globalId('PullRequest', num),
+            createdAt: Date.now(),
           };
           store.pulls.set(num, prObj);
-          sendJson(res, 201, {
-            number: num,
-            title,
-            body: prBody,
-            state: 'open',
-            merged: false,
-            head: prObj.head,
-            base: prObj.base,
-            id: prObj.id,
-          });
+          sendJson(res, 201, formatPull(prObj, store));
           return;
         }
 
@@ -642,24 +635,12 @@ export function createApp(): Server {
 
           if (pullSub === '' || pullSub === '/') {
             if (method === 'GET') {
-              sendJson(res, 200, {
-                number: pr.number,
-                title: pr.title,
-                body: pr.body,
-                state: pr.state,
-                merged: pr.merged,
-                merged_at: pr.mergedAt,
-                head: pr.head,
-                base: pr.base,
-                id: pr.id,
-                merge_commit_sha: pr.mergeCommitSha,
-              });
+              sendJson(res, 200, formatPull(pr, store));
               return;
             }
           }
 
           if (pullSub === '/files' && method === 'GET') {
-            // Return changed files for this PR
             const changedFiles = [{
               filename: 'src/main.ts',
               status: 'modified',
@@ -672,11 +653,18 @@ export function createApp(): Server {
           }
 
           if (pullSub === '/merge' && method === 'PUT') {
-            // Check conflict or merge
             if (pr.merged) {
               sendJson(res, 405, { message: 'Pull Request already merged' });
               return;
             }
+            // Check conflict: if base branch tip has changed since PR was created
+            const currentBaseSha = store.branches.get(pr.base.ref) || hashString(pr.base.ref);
+            if (currentBaseSha !== pr.base.sha && store.commits.length > 0) {
+              // Conflict check
+              sendJson(res, 405, { message: 'Pull Request merge conflict' });
+              return;
+            }
+
             const mergeSha = hashString(`merge-${pr.number}-${Date.now()}`);
             pr.merged = true;
             pr.state = 'closed';
@@ -699,31 +687,73 @@ export function createApp(): Server {
           }
         }
 
-        const contentsMatch = /^\/contents\/(.+)$/.exec(sub);
+        const contentsMatch = /^\/contents\/(.*)$/.exec(sub);
         if (contentsMatch) {
           const filePath = decodeURIComponent(contentsMatch[1]);
           if (method === 'GET') {
-            const queryRef = query.get('ref');
+            if (filePath === '' || filePath === '/') {
+              // root directory listing
+              const dirItems: any[] = [];
+              const seenDirs = new Set<string>();
+              for (const [fPath, fObj] of store.files.entries()) {
+                const parts = fPath.split('/');
+                const topName = parts[0];
+                if (parts.length === 1) {
+                  dirItems.push({
+                    type: 'file',
+                    name: topName,
+                    path: fPath,
+                    sha: fObj.sha,
+                    size: fObj.size,
+                  });
+                } else if (topName && !seenDirs.has(topName)) {
+                  seenDirs.add(topName);
+                  dirItems.push({
+                    type: 'dir',
+                    name: topName,
+                    path: topName,
+                    sha: fObj.sha,
+                    size: 0,
+                  });
+                }
+              }
+              sendJson(res, 200, dirItems);
+              return;
+            }
+
             const file = store.files.get(filePath);
             if (!file) {
-              // Check if directory
               const prefix = filePath.endsWith('/') ? filePath : `${filePath}/`;
               const dirItems: any[] = [];
+              const seenSubDirs = new Set<string>();
               for (const [fPath, fObj] of store.files.entries()) {
                 if (fPath.startsWith(prefix)) {
                   const rel = fPath.slice(prefix.length);
-                  if (!rel.includes('/')) {
+                  const subParts = rel.split('/');
+                  if (subParts.length === 1) {
                     dirItems.push({
                       type: 'file',
-                      name: rel,
+                      name: subParts[0],
                       path: fPath,
                       sha: fObj.sha,
                       size: fObj.size,
                     });
+                  } else {
+                    const subDirName = subParts[0];
+                    if (subDirName && !seenSubDirs.has(subDirName)) {
+                      seenSubDirs.add(subDirName);
+                      dirItems.push({
+                        type: 'dir',
+                        name: subDirName,
+                        path: `${prefix}${subDirName}`,
+                        sha: fObj.sha,
+                        size: 0,
+                      });
+                    }
                   }
                 }
               }
-              if (dirItems.length > 0 || filePath === store.description || filePath === 'src') {
+              if (dirItems.length > 0) {
                 sendJson(res, 200, dirItems);
                 return;
               }
@@ -770,10 +800,12 @@ export function createApp(): Server {
               size,
               commitSha,
             });
+            const targetBranch = body.branch || store.default_branch;
+            store.branches.set(targetBranch, commitSha);
             store.commits.push({
               sha: commitSha,
               message: body.message || 'Update file',
-              branch: body.branch || store.default_branch,
+              branch: targetBranch,
               author: DEFAULT_OWNER,
               timestamp: Date.now(),
             });
@@ -790,6 +822,11 @@ export function createApp(): Server {
               },
               commit: {
                 sha: commitSha,
+                node_id: commitSha,
+                author: { name: DEFAULT_OWNER },
+                committer: { name: DEFAULT_OWNER },
+                message: body.message || 'Update file',
+                tree: { sha: newSha },
               },
             });
             return;
@@ -840,11 +877,11 @@ export function createApp(): Server {
         const errors: any[] = [];
         const data: any = {};
 
-        if (q.includes('viewer') || q.includes('ViewerLogin')) {
+        if (q.includes('viewer') || q.includes('ViewerLogin') || q.includes('viewer')) {
           data.viewer = { login: DEFAULT_OWNER };
         }
 
-        if (q.includes('__type')) {
+        if (q.includes('__type') || q.includes('Issue') || q.includes('PullRequest') || q.includes('Repository') || q.includes('SearchType')) {
           if (q.includes('"Issue"') || q.includes('Issue:')) {
             data.Issue = {
               fields: [
@@ -906,7 +943,7 @@ export function createApp(): Server {
           } else {
             const repoData: any = {
               id: globalId('Repository', store.name),
-              databaseId: 101,
+              databaseId: store.id,
               name: store.name,
               nameWithOwner: `${store.owner}/${store.name}`,
               owner: { login: store.owner },
@@ -929,30 +966,38 @@ export function createApp(): Server {
 
             if (q.includes('issues')) {
               const issuesArr = Array.from(store.issues.values());
-              if (q.includes('OPEN')) {
-                // filter open
-                const openArr = issuesArr.filter(i => i.state === 'open');
-                openArr.sort((a, b) => b.number - a.number);
-                repoData.issues = {
-                  nodes: openArr.map(i => ({
-                    id: i.id,
-                    number: i.number,
-                    title: i.title,
-                    state: i.state.toUpperCase(),
-                  })),
-                  pageInfo: { hasNextPage: false, endCursor: null },
-                };
-              } else {
-                repoData.issues = {
-                  nodes: issuesArr.map(i => ({
-                    id: i.id,
-                    number: i.number,
-                    title: i.title,
-                    state: i.state.toUpperCase(),
-                  })),
-                  pageInfo: { hasNextPage: false, endCursor: null },
-                };
+              let filtered = issuesArr;
+              if (q.includes('OPEN') || vars?.states?.includes('OPEN')) {
+                filtered = issuesArr.filter(i => i.state === 'open');
               }
+              // Sort by created at desc or asc
+              filtered.sort((a, b) => b.number - a.number);
+
+              // Cursor pagination support
+              let startIndex = 0;
+              const after = vars?.after;
+              if (after) {
+                try {
+                  const decodedCursor = Number(Buffer.from(after, 'base64').toString('utf8'));
+                  const foundIdx = filtered.findIndex(i => i.number === decodedCursor);
+                  if (foundIdx !== -1) startIndex = foundIdx + 1;
+                } catch {}
+              }
+
+              const first = vars?.first ?? 10;
+              const slice = filtered.slice(startIndex, startIndex + first);
+              const hasNextPage = startIndex + first < filtered.length;
+              const endCursor = slice.length > 0 ? Buffer.from(String(slice[slice.length - 1].number)).toString('base64') : null;
+
+              repoData.issues = {
+                nodes: slice.map(i => ({
+                  id: i.id,
+                  number: i.number,
+                  title: i.title,
+                  state: i.state.toUpperCase(),
+                })),
+                pageInfo: { hasNextPage, endCursor },
+              };
             }
 
             if (q.includes('pullRequests')) {
@@ -980,7 +1025,7 @@ export function createApp(): Server {
                 headRefName: pr.head.ref,
                 baseRefName: pr.base.ref,
                 mergeable: 'MERGEABLE',
-                files: { nodes: [{ path: 'src/main.ts' }] },
+                files: { nodes: Array.from(store.files.keys()).map(p => ({ path: p })) },
               } : null;
             }
 
@@ -988,15 +1033,35 @@ export function createApp(): Server {
           }
         }
 
+        if (q.includes('node(')) {
+          const nodeId = vars?.id;
+          if (nodeId) {
+            const parsed = parseGlobalId(nodeId);
+            if (parsed) {
+              if (parsed.type === 'Repository') {
+                for (const r of repos.values()) {
+                  if (r.name === parsed.id || String(r.id) === String(parsed.id)) {
+                    data.node = {
+                      id: r.id,
+                      name: r.name,
+                      nameWithOwner: `${r.owner}/${r.name}`,
+                    };
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        }
+
         if (q.includes('createIssue')) {
           const input = vars?.input || {};
-          // find repo by global id or default store
-          let targetStore = store;
-          if (!targetStore && input.repositoryId) {
+          let targetStore: RepoStore | undefined;
+          if (input.repositoryId) {
             const parsed = parseGlobalId(input.repositoryId);
             if (parsed) {
               for (const r of repos.values()) {
-                if (r.name === parsed.id) {
+                if (r.name === parsed.id || String(r.id) === String(parsed.id)) {
                   targetStore = r;
                   break;
                 }
@@ -1041,12 +1106,12 @@ export function createApp(): Server {
 
         if (q.includes('createPullRequest')) {
           const input = vars?.input || {};
-          let targetStore = store;
-          if (!targetStore && input.repositoryId) {
+          let targetStore: RepoStore | undefined;
+          if (input.repositoryId) {
             const parsed = parseGlobalId(input.repositoryId);
             if (parsed) {
               for (const r of repos.values()) {
-                if (r.name === parsed.id) {
+                if (r.name === parsed.id || String(r.id) === String(parsed.id)) {
                   targetStore = r;
                   break;
                 }
@@ -1067,6 +1132,7 @@ export function createApp(): Server {
               head: { ref: input.headRefName || 'feature', sha: '1111111111111111111111111111111111111111' },
               base: { ref: input.baseRefName || targetStore.default_branch, sha: '2222222222222222222222222222222222222222' },
               id: globalId('PullRequest', num),
+              createdAt: Date.now(),
             };
             targetStore.pulls.set(num, prObj);
             data.createPullRequest = {
@@ -1096,6 +1162,31 @@ export function createApp(): Server {
                     number: pr.number,
                     merged: true,
                     state: 'MERGED',
+                  },
+                };
+                break;
+              }
+            }
+          }
+        }
+
+        if (q.includes('addComment')) {
+          const input = vars?.input || {};
+          const parsed = parseGlobalId(input.subjectId);
+          if (parsed) {
+            const num = Number(parsed.id);
+            for (const r of repos.values()) {
+              if (r.issues.has(num)) {
+                const issue = r.issues.get(num)!;
+                const commentId = issue.comments.length + 1;
+                const comment = { id: commentId, body: input.body || '', createdAt: Date.now() };
+                issue.comments.push(comment);
+                data.addComment = {
+                  commentEdge: {
+                    node: {
+                      id: globalId('IssueComment', commentId),
+                      body: comment.body,
+                    },
                   },
                 };
                 break;
@@ -1140,9 +1231,9 @@ export function createApp(): Server {
       }
 
       const handleRpc = (msg: any) => {
-        const id = msg.id ?? null;
-        const method = msg.method;
-        const params = msg.params || {};
+        const id = msg?.id ?? null;
+        const method = msg?.method;
+        const params = msg?.params || {};
 
         if (method === 'server/discover') {
           return {
@@ -1168,7 +1259,7 @@ export function createApp(): Server {
         }
 
         if (method === 'notifications/initialized') {
-          return null; // notification, no reply
+          return null;
         }
 
         if (method === 'tools/list') {
@@ -1195,6 +1286,7 @@ export function createApp(): Server {
                   owner: { type: 'string' },
                   repo: { type: 'string' },
                   full_name: { type: 'string' },
+                  name: { type: 'string' },
                 },
                 required: ['owner', 'repo'],
               },
@@ -1265,8 +1357,8 @@ export function createApp(): Server {
         if (method === 'tools/call') {
           const toolName = params.name || '';
           const args = params.arguments || {};
-          let owner = args.owner || DEFAULT_OWNER;
-          let repoName = args.repo || '';
+          let owner = args.owner || args.organization || args.org || DEFAULT_OWNER;
+          let repoName = args.repo || args.repository || args.name || '';
           if (!repoName && args.full_name && typeof args.full_name === 'string' && args.full_name.includes('/')) {
             const parts = args.full_name.split('/', 2);
             owner = parts[0];
@@ -1285,36 +1377,37 @@ export function createApp(): Server {
                 result: { content: [{ type: 'text', text: 'Missing required argument: name' }], isError: true },
               };
             }
-            const store: RepoStore = {
-              owner: DEFAULT_OWNER,
-              name,
-              private: args.private ?? true,
-              description: args.description ?? '',
-              default_branch: 'main',
-              createdAt: Date.now(),
-              files: new Map(),
-              branches: new Map([['main', '0000000000000000000000000000000000000000']]),
-              commits: [],
-              labels: new Map(),
-              issues: new Map(),
-              pulls: new Map(),
-              nextIssueNumber: 1,
-              nextPullNumber: 1,
-            };
-            repos.set(`${DEFAULT_OWNER}/${name}`.toLowerCase(), store);
+            const repoKey = `${DEFAULT_OWNER}/${name}`.toLowerCase();
+            let store = repos.get(repoKey);
+            if (!store) {
+              store = {
+                id: nextRepoId++,
+                owner: DEFAULT_OWNER,
+                name,
+                private: args.private ?? true,
+                description: args.description ?? '',
+                default_branch: 'main',
+                createdAt: Date.now(),
+                files: new Map(),
+                branches: new Map([['main', '0000000000000000000000000000000000000000']]),
+                commits: [],
+                labels: new Map(),
+                issues: new Map(),
+                pulls: new Map(),
+                nextIssueNumber: 1,
+                nextPullNumber: 1,
+              };
+              repos.set(repoKey, store);
+            }
             return {
               jsonrpc: '2.0',
               id,
               result: {
                 content: [{
                   type: 'text',
-                  text: JSON.stringify({
-                    name,
-                    full_name: `${DEFAULT_OWNER}/${name}`,
-                    private: store.private,
-                  }),
+                  text: JSON.stringify(formatRepo(store)),
                 }],
-                structuredContent: { name, full_name: `${DEFAULT_OWNER}/${name}` },
+                structuredContent: formatRepo(store),
               },
             };
           }
@@ -1334,13 +1427,9 @@ export function createApp(): Server {
               result: {
                 content: [{
                   type: 'text',
-                  text: JSON.stringify({
-                    name: store.name,
-                    full_name: `${store.owner}/${store.name}`,
-                    private: store.private,
-                  }),
+                  text: JSON.stringify(formatRepo(store)),
                 }],
-                structuredContent: { name: store.name, full_name: `${store.owner}/${store.name}` },
+                structuredContent: formatRepo(store),
               },
             };
           }
@@ -1370,8 +1459,8 @@ export function createApp(): Server {
               jsonrpc: '2.0',
               id,
               result: {
-                content: [{ type: 'text', text: JSON.stringify({ number: num, title: issue.title }) }],
-                structuredContent: { number: num, title: issue.title },
+                content: [{ type: 'text', text: JSON.stringify(formatIssue(issue, store)) }],
+                structuredContent: formatIssue(issue, store),
               },
             };
           }
@@ -1390,15 +1479,16 @@ export function createApp(): Server {
               jsonrpc: '2.0',
               id,
               result: {
-                content: [{ type: 'text', text: JSON.stringify(issuesArr.map(i => ({ number: i.number, title: i.title, state: i.state }))) }],
-                structuredContent: issuesArr,
+                content: [{ type: 'text', text: JSON.stringify(issuesArr.map(i => formatIssue(i, store))) }],
+                structuredContent: issuesArr.map(i => formatIssue(i, store)),
               },
             };
           }
 
           if (suffix.includes('createpullrequest') || toolName === 'create_pull_request') {
             const store = repos.get(`${owner}/${repoName}`.toLowerCase());
-            if (!store || !args.title || !args.head) {
+            const headRef = args.head || args.head_ref || '';
+            if (!store || !args.title || !headRef) {
               return {
                 jsonrpc: '2.0',
                 id,
@@ -1409,27 +1499,28 @@ export function createApp(): Server {
             const pr = {
               number: num,
               title: args.title,
-              body: '',
+              body: args.body || '',
               state: 'open' as const,
               merged: false,
-              head: { ref: args.head, sha: '1111111111111111111111111111111111111111' },
+              head: { ref: headRef, sha: '1111111111111111111111111111111111111111' },
               base: { ref: args.base || store.default_branch, sha: '2222222222222222222222222222222222222222' },
               id: globalId('PullRequest', num),
+              createdAt: Date.now(),
             };
             store.pulls.set(num, pr);
             return {
               jsonrpc: '2.0',
               id,
               result: {
-                content: [{ type: 'text', text: JSON.stringify({ number: num, title: pr.title }) }],
-                structuredContent: { number: num, title: pr.title },
+                content: [{ type: 'text', text: JSON.stringify(formatPull(pr, store)) }],
+                structuredContent: formatPull(pr, store),
               },
             };
           }
 
           if (suffix.includes('mergepullrequest') || toolName === 'merge_pull_request') {
             const store = repos.get(`${owner}/${repoName}`.toLowerCase());
-            const pullNum = Number(args.pull_number || args.number);
+            const pullNum = Number(args.pull_number || args.number || args.pull_request_number);
             const pr = store?.pulls.get(pullNum);
             if (!store || !pr) {
               return {
@@ -1444,8 +1535,8 @@ export function createApp(): Server {
               jsonrpc: '2.0',
               id,
               result: {
-                content: [{ type: 'text', text: JSON.stringify({ number: pullNum, merged: true }) }],
-                structuredContent: { number: pullNum, merged: true },
+                content: [{ type: 'text', text: JSON.stringify(formatPull(pr, store)) }],
+                structuredContent: formatPull(pr, store),
               },
             };
           }
