@@ -148,7 +148,7 @@ function diffTreePaths(git: any, commitSha: string): string[] {
       const nul = t.data.indexOf(0, p);
       if (nul < 0) break;
       const meta = t.data.slice(p, nul).toString('utf8');
-      const sp = meta.indexOf(32);
+      const sp = meta.indexOf(' ');
       const mode = meta.slice(0, sp);
       const name = meta.slice(sp + 1);
       const sha = t.data.slice(nul + 1, nul + 21).toString('hex');
