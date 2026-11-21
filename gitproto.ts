@@ -88,14 +88,13 @@ export class GitRepo {
     }
     for (const e of this.refEntries()) {
       if (prefixes.length > 0 && !prefixes.some((p) => e.name.startsWith(p))) continue;
-      out.push(pktLine(`${e.sha} ${e.name}\n`));
-      {
-        const obj = this.store.get(e.sha);
-        if (obj && obj.type === 'tag') {
-          const m = /^object ([0-9a-f]{40})/m.exec(obj.data.toString('utf8'));
-          if (m) out.push(pktLine(`${m[1]} ${e.name}^{}\n`));
-        }
+      let line = `${e.sha} ${e.name}`;
+      const obj = this.store.get(e.sha);
+      if (obj && obj.type === 'tag') {
+        const m = /^object ([0-9a-f]{40})/m.exec(obj.data.toString('utf8'));
+        if (m) line += ` peeled:${m[1]}`;
       }
+      out.push(pktLine(line + '\n'));
     }
     out.push(FLUSH);
     return Buffer.concat(out);
