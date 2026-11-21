@@ -89,7 +89,7 @@ export class GitRepo {
     for (const e of this.refEntries()) {
       if (prefixes.length > 0 && !prefixes.some((p) => e.name.startsWith(p))) continue;
       out.push(pktLine(`${e.sha} ${e.name}\n`));
-      if (peel) {
+      {
         const obj = this.store.get(e.sha);
         if (obj && obj.type === 'tag') {
           const m = /^object ([0-9a-f]{40})/m.exec(obj.data.toString('utf8'));
