@@ -44,7 +44,7 @@ export class GitRepo {
       return Buffer.concat(out);
     }
     const entries = this.refEntries().filter((e) => !refPrefixes || refPrefixes.length === 0 || refPrefixes.some((p) => e.name.startsWith(p)));
-    const caps = service === 'git-receive-pack' ? CAPS_V0 : CAPS_V0;
+    const caps = service === 'git-receive-pack' ? CAPS_V0 + ' delete-refs' : CAPS_V0;
     if (entries.length === 0) {
       out.push(pktLine(`${ZERO_OID} capabilities^{}\u0000${caps}\n`));
     } else {
@@ -89,7 +89,13 @@ export class GitRepo {
     for (const e of this.refEntries()) {
       if (prefixes.length > 0 && !prefixes.some((p) => e.name.startsWith(p))) continue;
       out.push(pktLine(`${e.sha} ${e.name}\n`));
-      // peeled lines omitted: some clients reject them in ls-refs responses
+      if (peel) {
+        const obj = this.store.get(e.sha);
+        if (obj && obj.type === 'tag') {
+          const m = /^object ([0-9a-f]{40})/m.exec(obj.data.toString('utf8'));
+          if (m) out.push(pktLine(`${m[1]} ${e.name}^{}\n`));
+        }
+      }
     }
     out.push(FLUSH);
     return Buffer.concat(out);
@@ -97,8 +103,42 @@ export class GitRepo {
 
   // ------------------------------------------------------------ v0 want/have + v2 fetch → packfile
   /** Compute the object list to send for the wants minus the haves (no history truncation). */
-  objectsForSend(wants: string[], haves: string[], depth: number | null): { objects: GitObject[]; shallowLines: string[]; unshallowLines: string[]; nothingNew: boolean } {
-    const haveSet = haves.length > 0 ? this.store.reachable(haves) : new Set<string>();
+  objectsForSend(wants: string[], haves: string[], depth: number | null, clientShallow: Set<string> = new Set()): { objects: GitObject[]; shallowLines: string[]; unshallowLines: string[]; nothingNew: boolean } {
+    // shallow-aware have computation: stop expanding at the client's shallow roots
+    let haveSet: Set<string>;
+    if (haves.length === 0) haveSet = new Set();
+    else if (depth !== null && clientShallow.size > 0) {
+      haveSet = new Set<string>();
+      const q: Array<{ sha: string; commit: boolean }> = haves.map((s) => ({ sha: s, commit: true }));
+      const seen = new Set<string>();
+      while (q.length > 0) {
+        const { sha, commit } = q.shift() as { sha: string; commit: boolean };
+        if (seen.has(sha)) continue;
+        const o = this.store.get(sha);
+        if (!o) continue;
+        seen.add(sha); haveSet.add(sha);
+        if (commit && clientShallow.has(sha)) continue; // client lacks this commit's history/tree
+        if (o.type === 'tree') {
+          let p = 0;
+          while (p < o.data.length) {
+            const nul = o.data.indexOf(0, p);
+            if (nul < 0) break;
+            const mode = o.data.slice(p, nul).toString('ascii');
+            q.push({ sha: o.data.slice(nul + 1, nul + 21).toString('hex'), commit: false });
+            p = nul + 21;
+            void mode;
+          }
+        } else if (o.type === 'commit') {
+          const text = o.data.toString('utf8');
+          const tm = /^tree ([0-9a-f]{40})/m.exec(text);
+          if (tm) q.push({ sha: tm[1], commit: false });
+          for (const pm of text.matchAll(/^parent ([0-9a-f]{40})/gm)) q.push({ sha: pm[1], commit: true });
+        } else if (o.type === 'tag') {
+          const m = /^object ([0-9a-f]{40})/m.exec(o.data.toString('utf8'));
+          if (m) q.push({ sha: m[1], commit: true });
+        }
+      }
+    } else haveSet = this.store.reachable(haves);
     const wantTips = wants.map((w) => this.store.get(w)).filter(Boolean).map((o) => (o as GitObject).sha);
     // commit walking with depth support
     const send = new Set<string>();
@@ -121,6 +161,9 @@ export class GitRepo {
       if (!obj) continue;
       visited.add(sha);
       if (!haveSet.has(sha)) send.add(sha);
+      if (obj.type === 'commit' && clientShallow.has(sha)) {
+        if (!unshallowLines.includes(`unshallow ${sha}`)) unshallowLines.push(`unshallow ${sha}`);
+      }
       if (obj.type !== 'commit') {
         // trees/blobs/tags: always expand below
         if (obj.type === 'tree') {
@@ -204,10 +247,12 @@ export class GitRepo {
     let depth: number | null = null;
     let done = false;
     let wantSideband = true;
+    const clientShallow = new Set<string>();
     for (const line of lines) {
       const t = line.trim();
       if (t.startsWith('want ')) wants.push(t.slice(5).trim());
       else if (t.startsWith('have ')) haves.push(t.slice(5).trim());
+      else if (t.startsWith('shallow ')) clientShallow.add(t.slice(8).trim());
       else if (t === 'done') done = true;
       else if (t.startsWith('deepen ')) depth = parseInt(t.slice(7).trim(), 10) || null;
       else if (t.startsWith('filter ')) { /* blob:none not supported: ignore */ }
@@ -222,7 +267,7 @@ export class GitRepo {
       return Buffer.concat(out);
     }
     console.log('[git] fetchV2 wants=%j haves=%j done=%s depth=%s', wants, haves, done, depth);
-    const result = this.objectsForSend(wants, haves, depth);
+    const result = this.objectsForSend(wants, haves, depth, clientShallow);
     const DELIM = Buffer.from('0001', 'ascii');
     if (!done) {
       out.push(pktLine('acknowledgments\n'));
@@ -236,9 +281,10 @@ export class GitRepo {
       out.push(FLUSH);
       return Buffer.concat(out);
     }
-    if (result.shallowLines.length > 0) {
+    if (result.shallowLines.length > 0 || result.unshallowLines.length > 0) {
       out.push(pktLine('shallow-info\n'));
       for (const l of result.shallowLines) out.push(pktLine(l + '\n'));
+      for (const l of result.unshallowLines) out.push(pktLine(l + '\n'));
       out.push(DELIM);
     }
     out.push(pktLine('packfile\n'));

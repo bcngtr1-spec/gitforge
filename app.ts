@@ -1083,7 +1083,7 @@ export function createApp(): Server {
                 headRefName: pr.head.ref,
                 baseRefName: pr.base.ref,
                 mergeable: 'MERGEABLE',
-                files: { nodes: Array.from(store.files.keys()).map(p => ({ path: p })) },
+                files: { nodes: (pr.changedFiles ?? []).map((p) => ({ path: p })) },
               } : null;
             }
 
