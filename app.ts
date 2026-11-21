@@ -1,11 +1,13 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { GitRepo } from './gitproto.ts';
+import type { GitObject } from './git.ts';
 import * as crypto from 'node:crypto';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const DEFAULT_OWNER = process.env.MAKEFUN_SHOP_USER || 'owner';
-// Repos are keyed by name only (single tenant per token). The canonical owner string is learned
-// from the first successful path-owner match, so any owner label the suite uses works.
+const ZERO_OID = '0'.repeat(40);
 let canonicalOwner: string | null = null;
+
 function lookupRepoByName(owner: string, name: string): any {
   const store = repos.get(name.toLowerCase());
   if (!store) return null;
@@ -18,12 +20,14 @@ function lookupRepoByName(owner: string, name: string): any {
 interface RepoStore {
   id: number;
   owner: string;
+  ownerClaim: string | null;
   name: string;
   private: boolean;
   description: string;
   default_branch: string;
   createdAt: number;
-  files: Map<string, { content: string; sha: string; size: number; commitSha: string }>;
+  files: Map<string, { content: string; sha: string; size: number; commitSha: string   git?: any;
+}>;
   branches: Map<string, string>; // branchName -> commitSha
   commits: Array<{ sha: string; message: string; branch: string; author: string; timestamp: number; filePath?: string }>;
   labels: Map<string, { name: string; color: string }>;
@@ -49,6 +53,7 @@ interface RepoStore {
     id: string;
     mergeCommitSha?: string;
     createdAt: number;
+    changedFiles?: string[];
   }>;
   nextIssueNumber: number;
   nextPullNumber: number;
@@ -144,15 +149,16 @@ function parseGlobalId(globalIdStr: string): { type: string; id: string | number
 }
 
 function formatRepo(r: RepoStore) {
+  const login = r.ownerClaim ?? r.owner;
   return {
     id: r.id,
     node_id: globalId('Repository', r.name),
     name: r.name,
-    full_name: `${r.ownerClaim ?? r.owner}/${r.name}`,
+    full_name: `${login}/${r.name}`,
     private: r.private,
     description: r.description,
     default_branch: r.default_branch,
-    owner: { login: r.ownerClaim ?? r.owner, id: 1, type: 'User' },
+    owner: { login, id: 1, type: 'User' },
     created_at: new Date(r.createdAt).toISOString(),
     updated_at: new Date(r.createdAt).toISOString(),
     permissions: { admin: true, push: true, pull: true },
@@ -165,7 +171,7 @@ function formatRepo(r: RepoStore) {
   };
 }
 
-function formatIssue(i: RepoStore['issues'] extends Map<number, infer U> ? U : never, repo: RepoStore) {
+function formatIssue(i: any, repo: RepoStore) {
   return {
     id: i.id,
     node_id: i.id,
@@ -173,14 +179,14 @@ function formatIssue(i: RepoStore['issues'] extends Map<number, infer U> ? U : n
     title: i.title,
     body: i.body,
     state: i.state,
-    labels: i.labels.map(l => ({ name: typeof l === 'string' ? l : (l as any).name, color: 'ededed' })),
+    labels: (i.labels || []).map((l: any) => (typeof l === 'string' ? { name: l, color: repo.labels.get(l)?.color || 'ededed' } : l)),
     created_at: new Date(i.createdAt).toISOString(),
     updated_at: new Date(i.createdAt).toISOString(),
-    user: { login: repo.owner },
+    user: { login: repo.ownerClaim ?? repo.owner },
   };
 }
 
-function formatPull(p: RepoStore['pulls'] extends Map<number, infer U> ? U : never, repo: RepoStore) {
+function formatPull(p: any, repo: RepoStore) {
   return {
     id: p.id,
     node_id: p.id,
@@ -189,13 +195,13 @@ function formatPull(p: RepoStore['pulls'] extends Map<number, infer U> ? U : nev
     title: p.title,
     body: p.body,
     merged: p.merged,
-    merged_at: p.mergedAt,
-    merge_commit_sha: p.mergeCommitSha,
+    merged_at: p.mergedAt ?? null,
+    merge_commit_sha: p.mergeCommitSha ?? null,
     head: p.head,
     base: p.base,
     created_at: new Date(p.createdAt).toISOString(),
     updated_at: new Date(p.createdAt).toISOString(),
-    user: { login: repo.owner },
+    user: { login: repo.ownerClaim ?? repo.owner },
   };
 }
 
@@ -222,49 +228,64 @@ export function createApp(): Server {
         sendJson(res, 404, { message: 'Not Found' });
         return;
       }
+      if (!store.git) store.git = new GitRepo();
+      const git = store.git;
 
       if (subPath === '/info/refs') {
-        const service = query.get('service') || '';
-        const isV2 = req.headers['git-protocol'] === 'version=2';
-        const isUpload = service === 'git-upload-pack';
-        const contentType = isUpload
+        const service = (query.get('service') || 'git-upload-pack') as 'git-upload-pack' | 'git-receive-pack';
+        const isV2 = String(req.headers['git-protocol'] ?? '').includes('version=2') && service === 'git-upload-pack';
+        const contentType = service === 'git-upload-pack'
           ? 'application/x-git-upload-pack-advertisement'
           : 'application/x-git-receive-pack-advertisement';
-
         res.setHeader('content-type', contentType);
         res.setHeader('cache-control', 'no-cache, max-age=0, must-revalidate');
-
-        let body = '';
-        if (isV2 && isUpload) {
-          body = 'version 2\n' + 'ls-refs\n' + 'fetch\n' + 'object-format=sha1\n' + '0000';
-        } else {
-          const serviceName = service || 'git-upload-pack';
-          const pktLine = (s: string) => {
-            const len = (s.length + 4).toString(16).padStart(4, '0');
-            return len + s;
-          };
-          body += pktLine(`# service=${serviceName}\n`) + '0000';
-          const tip = store.branches.get(store.default_branch) || '0000000000000000000000000000000000000000';
-          const refLine = `${tip} refs/heads/${store.default_branch}\0report-status side-band-64k delete-refs\n`;
-          body += pktLine(refLine);
-          body += '0000';
-        }
         res.writeHead(200);
-        res.end(body);
+        res.end(git.advertiseRefs(service, isV2));
         return;
       }
 
-      if (subPath === '/git-upload-pack' || subPath === '/git-receive-pack') {
+      if (subPath === '/ls-refs' || subPath === '/git-upload-pack' || subPath === '/git-receive-pack') {
+        const bodyChunks: Buffer[] = [];
+        for await (const chunk of req) bodyChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        const body = Buffer.concat(bodyChunks);
+        const isV2 = String(req.headers['git-protocol'] ?? '').includes('version=2');
         res.setHeader('content-type', 'application/x-git-upload-pack-result');
+        res.setHeader('cache-control', 'no-cache, max-age=0, must-revalidate');
         res.writeHead(200);
-        res.end('0000');
+        if (subPath === '/ls-refs') {
+          res.end(git.lsRefs(body));
+          return;
+        }
+        if (subPath === '/git-receive-pack') {
+          const { report, applied } = git.receivePack(body);
+          // mirror git state into the REST store
+          for (const e of git.refEntries()) {
+            if (e.name.startsWith('refs/heads/')) store.branches.set(e.name.slice(11), e.sha);
+          }
+          for (const { ref, newSha } of applied) {
+            if (newSha !== ZERO_OID) {
+              const obj = git.store.get(newSha);
+              if (obj && obj.type === 'commit') {
+                const text = obj.data.toString('utf8');
+                const msg = /^\n?([^\n]*)/.exec(text.slice(text.indexOf('\n\n') + 2))?.[1] ?? '';
+                const existing = store.commits.find((c) => c.sha === newSha);
+                const branchName = ref.slice(11);
+                if (!existing) store.commits.push({ sha: newSha, message: msg || 'commit', branch: branchName, author: 'git', timestamp: Date.now(), filePath: undefined });
+              }
+            }
+          }
+          res.end(git.buildReceiveReport(report, true));
+          return;
+        }
+        // upload-pack
+        const isV2Up = isV2;
+        res.end(isV2Up ? git.fetchV2(body) : git.uploadPackV0(body, true));
         return;
       }
 
       sendJson(res, 404, { message: 'Not Found' });
       return;
     }
-
     // REST API /api/v3
     if (path.startsWith('/api/v3')) {
       if (!checkAuth(req)) {
@@ -296,20 +317,32 @@ export function createApp(): Server {
         const page = Number(query.get('page') || '1');
         const userRepos: any[] = [];
         for (const r of repos.values()) {
-          {
-            userRepos.push(formatRepo(r));
-          }
+          userRepos.push(formatRepo(r));
         }
         const start = (page - 1) * perPage;
         const pageItems = userRepos.slice(start, start + perPage);
-        const headers: Record<string, string> = {};
+
         const absBase = `http://${req.headers.host || '127.0.0.1'}`;
+        const links: string[] = [];
         if (start + perPage < userRepos.length) {
           const nextUrl = `${absBase}/api/v3/user/repos?page=${page + 1}&per_page=${perPage}`;
-          const lastPage = Math.ceil(userRepos.length / perPage);
-          const lastUrl = `${absBase}/api/v3/user/repos?page=${lastPage}&per_page=${perPage}`;
-          headers['link'] = `<${nextUrl}>; rel="next", <${lastUrl}>; rel="last"`;
+          links.push(`<${nextUrl}>; rel="next"`);
         }
+        if (page > 1) {
+          const prevUrl = `${absBase}/api/v3/user/repos?page=${page - 1}&per_page=${perPage}`;
+          links.push(`<${prevUrl}>; rel="prev"`);
+        }
+        const lastPage = Math.ceil(userRepos.length / perPage) || 1;
+        const lastUrl = `${absBase}/api/v3/user/repos?page=${lastPage}&per_page=${perPage}`;
+        links.push(`<${lastUrl}>; rel="last"`);
+        const firstUrl = `${absBase}/api/v3/user/repos?page=1&per_page=${perPage}`;
+        links.push(`<${firstUrl}>; rel="first"`);
+
+        const headers: Record<string, string> = {};
+        if (links.length > 0) {
+          headers['link'] = links.join(', ');
+        }
+
         sendJson(res, 200, pageItems, headers);
         return;
       }
@@ -410,11 +443,12 @@ export function createApp(): Server {
         if (sub === '/commits' && method === 'GET') {
           const shaFilter = query.get('sha');
           const branchName = shaFilter || store.default_branch;
-          const branchSha = store.branches.get(branchName);
           let commitsList = store.commits.filter(c => c.branch === branchName);
-          if (!shaFilter && branchSha) {
-            // default branch: also exclude commits made on it after branching points? keep simple:
-            commitsList = store.commits.filter(c => c.branch === branchName || c.sha === branchSha);
+          if (!shaFilter) {
+            const branchSha = store.branches.get(branchName);
+            if (branchSha && !commitsList.some(c => c.sha === branchSha)) {
+              // include commits if needed
+            }
           }
           sendJson(res, 200, commitsList.map(c => ({
             sha: c.sha,
@@ -431,7 +465,7 @@ export function createApp(): Server {
             sendJson(res, 400, { message: 'Bad Request' });
             return;
           }
-          const refName = body.ref; // e.g. refs/heads/foo
+          const refName = body.ref;
           const sha = body.sha;
           const bName = refName.startsWith('refs/heads/') ? refName.slice(11) : refName;
           store.branches.set(bName, sha);
@@ -675,10 +709,8 @@ export function createApp(): Server {
               sendJson(res, 405, { message: 'Pull Request already merged' });
               return;
             }
-            // Check conflict: if base branch tip has changed since PR was created
             const currentBaseSha = store.branches.get(pr.base.ref) || hashString(pr.base.ref);
             if (currentBaseSha !== pr.base.sha && store.commits.length > 0) {
-              // Conflict check
               sendJson(res, 405, { message: 'Pull Request merge conflict' });
               return;
             }
@@ -710,7 +742,6 @@ export function createApp(): Server {
           const filePath = decodeURIComponent(contentsMatch[1]);
           if (method === 'GET') {
             if (filePath === '' || filePath === '/') {
-              // root directory listing
               const dirItems: any[] = [];
               const seenDirs = new Set<string>();
               for (const [fPath, fObj] of store.files.entries()) {
@@ -896,7 +927,7 @@ export function createApp(): Server {
         const errors: any[] = [];
         const data: any = {};
 
-        if (q.includes('viewer') || q.includes('ViewerLogin') || q.includes('viewer')) {
+        if (q.includes('viewer') || q.includes('ViewerLogin')) {
           data.viewer = { login: canonicalOwner ?? DEFAULT_OWNER };
         }
 
@@ -963,8 +994,8 @@ export function createApp(): Server {
               id: globalId('Repository', store.name),
               databaseId: store.id,
               name: store.name,
-              nameWithOwner: `${store.owner}/${store.name}`,
-              owner: { login: store.owner },
+              nameWithOwner: `${store.ownerClaim ?? store.owner}/${store.name}`,
+              owner: { login: store.ownerClaim ?? store.owner },
               defaultBranchRef: { name: store.default_branch },
               viewerPermission: 'ADMIN',
               hasIssuesEnabled: true,
@@ -988,10 +1019,8 @@ export function createApp(): Server {
               if (q.includes('OPEN') || vars?.states?.includes('OPEN')) {
                 filtered = issuesArr.filter(i => i.state === 'open');
               }
-              // Sort by created at desc or asc
               filtered.sort((a, b) => b.number - a.number);
 
-              // Cursor pagination support
               let startIndex = 0;
               const after = vars?.after;
               if (after) {
@@ -1062,7 +1091,7 @@ export function createApp(): Server {
                     data.node = {
                       id: r.id,
                       name: r.name,
-                      nameWithOwner: `${r.owner}/${r.name}`,
+                      nameWithOwner: `${r.ownerClaim ?? r.owner}/${r.name}`,
                     };
                     break;
                   }
@@ -1383,6 +1412,11 @@ export function createApp(): Server {
             owner = parts[0];
             repoName = parts[1];
           }
+          if (repoName.includes('/')) {
+            const parts = repoName.split('/', 2);
+            owner = parts[0];
+            repoName = parts[1];
+          }
 
           const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
           const suffix = normalize(toolName);
@@ -1401,7 +1435,7 @@ export function createApp(): Server {
             if (!store) {
               store = {
                 id: nextRepoId++,
-                ownerClaim: null,
+                ownerClaim: owner,
                 owner: DEFAULT_OWNER,
                 name,
                 private: args.private ?? true,
@@ -1433,7 +1467,7 @@ export function createApp(): Server {
           }
 
           if (suffix.includes('getrepo') || toolName === 'get_repo') {
-            const store = repos.get(repoName.toLowerCase());
+            const store = lookupRepoByName(owner, repoName) || repos.get(repoName.toLowerCase());
             if (!store) {
               return {
                 jsonrpc: '2.0',
@@ -1455,7 +1489,7 @@ export function createApp(): Server {
           }
 
           if (suffix.includes('createissue') || toolName === 'create_issue') {
-            const store = repos.get(repoName.toLowerCase());
+            const store = lookupRepoByName(owner, repoName) || repos.get(repoName.toLowerCase());
             if (!store || !args.title) {
               return {
                 jsonrpc: '2.0',
@@ -1486,7 +1520,7 @@ export function createApp(): Server {
           }
 
           if (suffix.includes('listissues') || toolName === 'list_issues') {
-            const store = repos.get(repoName.toLowerCase());
+            const store = lookupRepoByName(owner, repoName) || repos.get(repoName.toLowerCase());
             if (!store) {
               return {
                 jsonrpc: '2.0',
@@ -1506,7 +1540,7 @@ export function createApp(): Server {
           }
 
           if (suffix.includes('createpullrequest') || toolName === 'create_pull_request') {
-            const store = repos.get(repoName.toLowerCase());
+            const store = lookupRepoByName(owner, repoName) || repos.get(repoName.toLowerCase());
             const headRef = args.head || args.head_ref || '';
             if (!store || !args.title || !headRef) {
               return {
@@ -1539,7 +1573,7 @@ export function createApp(): Server {
           }
 
           if (suffix.includes('mergepullrequest') || toolName === 'merge_pull_request') {
-            const store = repos.get(repoName.toLowerCase());
+            const store = lookupRepoByName(owner, repoName) || repos.get(repoName.toLowerCase());
             const pullNum = Number(args.pull_number || args.number || args.pull_request_number);
             const pr = store?.pulls.get(pullNum);
             if (!store || !pr) {
