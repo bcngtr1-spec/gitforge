@@ -385,7 +385,7 @@ export function createApp(): Server {
             return;
           }
           if (method === 'DELETE') {
-            repos.delete(repoKey);
+            repos.delete(repoName.toLowerCase());
             sendEmpty(res, 204);
             return;
           }
