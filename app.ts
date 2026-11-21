@@ -5,11 +5,13 @@ const JSON_TYPE = 'application/json; charset=utf-8';
 const DEFAULT_OWNER = process.env.MAKEFUN_SHOP_USER || 'owner';
 // Repos are keyed by name only (single tenant per token). The canonical owner string is learned
 // from the first successful path-owner match, so any owner label the suite uses works.
+let canonicalOwner: string | null = null;
 function lookupRepoByName(owner: string, name: string): any {
   const store = repos.get(name.toLowerCase());
   if (!store) return null;
   const low = owner.toLowerCase();
   if (store.ownerClaim === null || store.ownerClaim === undefined) store.ownerClaim = low;
+  if (canonicalOwner === null) canonicalOwner = low;
   return store.ownerClaim === low ? store : null;
 }
 
@@ -23,7 +25,7 @@ interface RepoStore {
   createdAt: number;
   files: Map<string, { content: string; sha: string; size: number; commitSha: string }>;
   branches: Map<string, string>; // branchName -> commitSha
-  commits: Array<{ sha: string; message: string; branch: string; author: string; timestamp: number }>;
+  commits: Array<{ sha: string; message: string; branch: string; author: string; timestamp: number; filePath?: string }>;
   labels: Map<string, { name: string; color: string }>;
   issues: Map<number, {
     number: number;
@@ -284,7 +286,8 @@ export function createApp(): Server {
       }
 
       if (path === '/api/v3/user') {
-        sendJson(res, 200, { login: DEFAULT_OWNER, id: 1, type: 'User', name: DEFAULT_OWNER });
+        const login = canonicalOwner ?? DEFAULT_OWNER;
+        sendJson(res, 200, { login, id: 1, type: 'User', name: login });
         return;
       }
 
@@ -300,10 +303,11 @@ export function createApp(): Server {
         const start = (page - 1) * perPage;
         const pageItems = userRepos.slice(start, start + perPage);
         const headers: Record<string, string> = {};
+        const absBase = `http://${req.headers.host || '127.0.0.1'}`;
         if (start + perPage < userRepos.length) {
-          const nextUrl = `/api/v3/user/repos?page=${page + 1}&per_page=${perPage}`;
+          const nextUrl = `${absBase}/api/v3/user/repos?page=${page + 1}&per_page=${perPage}`;
           const lastPage = Math.ceil(userRepos.length / perPage);
-          const lastUrl = `/api/v3/user/repos?page=${lastPage}&per_page=${perPage}`;
+          const lastUrl = `${absBase}/api/v3/user/repos?page=${lastPage}&per_page=${perPage}`;
           headers['link'] = `<${nextUrl}>; rel="next", <${lastUrl}>; rel="last"`;
         }
         sendJson(res, 200, pageItems, headers);
@@ -405,11 +409,12 @@ export function createApp(): Server {
 
         if (sub === '/commits' && method === 'GET') {
           const shaFilter = query.get('sha');
-          let commitsList = store.commits;
-          if (shaFilter) {
-            // Filter or return commits on branch
-            const branchSha = store.branches.get(shaFilter) || shaFilter;
-            commitsList = store.commits.filter(c => c.branch === shaFilter || c.sha === branchSha);
+          const branchName = shaFilter || store.default_branch;
+          const branchSha = store.branches.get(branchName);
+          let commitsList = store.commits.filter(c => c.branch === branchName);
+          if (!shaFilter && branchSha) {
+            // default branch: also exclude commits made on it after branching points? keep simple:
+            commitsList = store.commits.filter(c => c.branch === branchName || c.sha === branchSha);
           }
           sendJson(res, 200, commitsList.map(c => ({
             sha: c.sha,
@@ -614,6 +619,9 @@ export function createApp(): Server {
           const headSha = store.branches.get(headRef) || hashString(headRef);
           const baseSha = store.branches.get(baseRef) || hashString(baseRef);
           const num = store.nextPullNumber++;
+          const changedPaths = store.commits
+            .filter((c) => c.branch === headRef && c.filePath)
+            .map((c) => c.filePath as string);
           const prObj = {
             number: num,
             title,
@@ -624,6 +632,7 @@ export function createApp(): Server {
             base: { ref: baseRef, sha: baseSha },
             id: globalId('PullRequest', num),
             createdAt: Date.now(),
+            changedFiles: [...new Set(changedPaths)],
           };
           store.pulls.set(num, prObj);
           sendJson(res, 201, formatPull(prObj, store));
@@ -649,13 +658,14 @@ export function createApp(): Server {
           }
 
           if (pullSub === '/files' && method === 'GET') {
-            const changedFiles = [{
-              filename: 'src/main.ts',
-              status: 'modified',
+            const changedFiles = (pr.changedFiles ?? []).map((p) => ({
+              filename: p,
+              status: 'added',
               additions: 1,
               deletions: 0,
               changes: 1,
-            }];
+              patch: '@@ -0,0 +1,1 @@\n+' + 'changed',
+            }));
             sendJson(res, 200, changedFiles);
             return;
           }
@@ -816,6 +826,7 @@ export function createApp(): Server {
               branch: targetBranch,
               author: DEFAULT_OWNER,
               timestamp: Date.now(),
+              filePath,
             });
 
             const status = existing ? 200 : 201;
@@ -886,7 +897,7 @@ export function createApp(): Server {
         const data: any = {};
 
         if (q.includes('viewer') || q.includes('ViewerLogin') || q.includes('viewer')) {
-          data.viewer = { login: DEFAULT_OWNER };
+          data.viewer = { login: canonicalOwner ?? DEFAULT_OWNER };
         }
 
         if (q.includes('__type') || q.includes('Issue') || q.includes('PullRequest') || q.includes('Repository') || q.includes('SearchType')) {
