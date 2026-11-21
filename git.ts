@@ -28,6 +28,7 @@ export function parsePktStream(buf: Buffer): { lines: string[]; rest: Buffer; en
     const len = parseInt(lenText, 16);
     if (Number.isNaN(len)) return { lines, rest: buf.slice(pos), endsWithFlush: false };
     if (len === 0) { lines.push(''); pos += 4; continue; }
+    if (len === 1) { lines.push(''); pos += 4; continue; } // delim-pkt: section separator, treated like flush
     if (len < 4 || pos + len > buf.length) return { lines, rest: buf.slice(pos), endsWithFlush: false };
     lines.push(buf.slice(pos + 4, pos + len).toString('utf8'));
     pos += len;
@@ -111,7 +112,7 @@ function adler32(data: Buffer): Buffer {
   let a = 1, b = 0;
   for (let i = 0; i < data.length; i++) { a = (a + data[i]) % 65521; b = (b + a) % 65521; }
   const buf = Buffer.alloc(4);
-  buf.writeUInt32BE((b << 16) | a);
+  buf.writeUInt32BE((b * 65536 + a) % 4294967296);
   return buf;
 }
 

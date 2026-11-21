@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { GitRepo } from './gitproto.ts';
+import { parsePktStream as parsePktStreamQuick } from './git.ts';
 import type { GitObject } from './git.ts';
 import * as crypto from 'node:crypto';
 
@@ -26,8 +27,8 @@ interface RepoStore {
   description: string;
   default_branch: string;
   createdAt: number;
-  files: Map<string, { content: string; sha: string; size: number; commitSha: string   git?: any;
-}>;
+  files: Map<string, { content: string; sha: string; size: number; commitSha: string }>;
+  git?: any;
   branches: Map<string, string>; // branchName -> commitSha
   commits: Array<{ sha: string; message: string; branch: string; author: string; timestamp: number; filePath?: string }>;
   labels: Map<string, { name: string; color: string }>;
@@ -256,7 +257,17 @@ export function createApp(): Server {
           res.end(git.lsRefs(body));
           return;
         }
+        if (subPath === '/git-upload-pack' && isV2) {
+          // v2 multiplexes commands in the request body
+          const head = parsePktStreamQuick(body).lines[0]?.trim() ?? '';
+          const cmd = head.startsWith('command=') ? head.slice('command='.length).trim() : head;
+          const head2 = parsePktStreamQuick(body).lines.filter((l) => l !== '').slice(0, 5);
+          console.log('[git] v2 cmd=%s lines=%j bodyLen=%d', cmd, head2, body.length);
+          res.end(cmd === 'ls-refs' ? git.lsRefs(body) : git.fetchV2(body));
+          return;
+        }
         if (subPath === '/git-receive-pack') {
+          console.log('[git] receive-pack bodyLen=%d', body.length);
           const { report, applied } = git.receivePack(body);
           // mirror git state into the REST store
           for (const e of git.refEntries()) {

@@ -9,6 +9,7 @@ const ZERO_OID = '0000000000000000000000000000000000000000';
 const CAPS_V0 = 'report-status-v2 report-status side-band-64k ofs-delta object-format=sha1 agent=forge/1';
 
 export class GitRepo {
+  defaultBranch = 'main';
   store = new ObjectStore();
   refs = new Map<string, string>(); // full ref name -> sha
   shallow = new Set<string>(); // shallow roots from client deepen
@@ -35,9 +36,9 @@ export class GitRepo {
     }
     if (v2) {
       out.push(pktLine('version 2\n'));
-      out.push(pktLine('capability ls-refs=unborn\n'));
-      out.push(pktLine('capability fetch=shallow\n'));
-      out.push(pktLine('capability sideband-64k\n'));
+      out.push(pktLine('ls-refs=unborn\n'));
+      out.push(pktLine('fetch=shallow\n'));
+      out.push(pktLine('sideband-64k\n'));
       out.push(pktLine('object-format=sha1\n'));
       out.push(FLUSH);
       return Buffer.concat(out);
@@ -80,16 +81,15 @@ export class GitRepo {
       else if (t.startsWith('ref-prefix ')) prefixes.push(t.slice('ref-prefix '.length).trim());
     }
     const out: Buffer[] = [];
+    if (symrefs && (prefixes.length === 0 || prefixes.some((p) => 'HEAD'.startsWith(p)))) {
+      const headSha = this.resolve('HEAD') ?? this.resolve(`refs/heads/${this.defaultBranch}`) ?? null;
+      if (headSha) out.push(pktLine(`${headSha} HEAD symref-target:refs/heads/${this.defaultBranch}\n`));
+      else if (unborn) out.push(pktLine(`unborn HEAD symref-target:refs/heads/${this.defaultBranch}\n`));
+    }
     for (const e of this.refEntries()) {
       if (prefixes.length > 0 && !prefixes.some((p) => e.name.startsWith(p))) continue;
       out.push(pktLine(`${e.sha} ${e.name}\n`));
-      if (peel) {
-        const obj = this.store.get(e.sha);
-        if (obj && obj.type === 'tag') {
-          const m = /^object ([0-9a-f]{40})/m.exec(obj.data.toString('utf8'));
-          if (m) out.push(pktLine(`peeled ${m[1]}\n`));
-        }
-      }
+      // peeled lines omitted: some clients reject them in ls-refs responses
     }
     out.push(FLUSH);
     return Buffer.concat(out);
@@ -109,24 +109,41 @@ export class GitRepo {
       for (const sha of all) if (!haveSet.has(sha)) send.add(sha);
       return { objects: [...send].map((s) => this.store.get(s) as GitObject), shallowLines, unshallowLines, nothingNew: send.size === 0 };
     }
-    // shallow: walk commits up to depth; non-commit objects always sent fully
+    // shallow: walk commits up to depth; the boundary commit's tree is included, parents are not
     const boundary = new Set<string>();
     const visited = new Set<string>();
-    type Walk = { sha: string; depth: number };
-    const queue: Walk[] = wantTips.map((sha) => ({ sha, depth: 1 }));
+    type Walk = { sha: string; depth: number; isCommit: boolean };
+    const queue: Walk[] = wantTips.map((sha) => ({ sha, depth: 1, isCommit: true }));
     while (queue.length > 0) {
-      const { sha, depth } = queue.shift() as Walk;
+      const { sha, depth: d, isCommit } = queue.shift() as Walk;
       if (visited.has(sha) || sha === ZERO_OID) continue;
       const obj = this.store.get(sha);
       if (!obj) continue;
       visited.add(sha);
       if (!haveSet.has(sha)) send.add(sha);
-      if (obj.type !== 'commit') continue;
-      if (depth >= depth) { boundary.add(sha); continue; }
+      if (obj.type !== 'commit') {
+        // trees/blobs/tags: always expand below
+        if (obj.type === 'tree') {
+          let p = 0;
+          while (p < obj.data.length) {
+            const nul = obj.data.indexOf(0, p);
+            if (nul < 0) break;
+            const mode = obj.data.slice(p, nul).toString('ascii');
+            const childSha = obj.data.slice(nul + 1, nul + 21).toString('hex');
+            p = nul + 21;
+            if (mode !== '160000') queue.push({ sha: childSha, depth: 1, isCommit: false });
+          }
+        } else if (obj.type === 'tag') {
+          const m = /^object ([0-9a-f]{40})/m.exec(obj.data.toString('utf8'));
+          if (m) queue.push({ sha: m[1], depth: 1, isCommit: true });
+        }
+        continue;
+      }
       const text = obj.data.toString('utf8');
       const treeMatch = /^tree ([0-9a-f]{40})/m.exec(text);
-      if (treeMatch) queue.push({ sha: treeMatch[1], depth: 1 });
-      for (const parent of text.matchAll(/^parent ([0-9a-f]{40})/gm)) queue.push({ sha: parent[1], depth: depth + 1 });
+      if (treeMatch) queue.push({ sha: treeMatch[1], depth: 1, isCommit: false });
+      if (isCommit && d >= depth) { boundary.add(sha); continue; }
+      for (const parent of text.matchAll(/^parent ([0-9a-f]{40})/gm)) queue.push({ sha: parent[1], depth: d + 1, isCommit: true });
     }
     for (const sha of boundary) shallowLines.push(`shallow ${sha}`);
     return { objects: [...send].map((s) => this.store.get(s) as GitObject), shallowLines, unshallowLines, nothingNew: send.size === 0 };
@@ -199,25 +216,34 @@ export class GitRepo {
     if (!done) {
       // acknowledgments section without done
       out.push(pktLine('acknowledgments\n'));
-      const ready = haves.some((h) => this.store.has(h));
-      for (const h of haves.slice(0, 32)) if (this.store.has(h)) out.push(pktLine(`ack ${h}\n`));
-      if (!ready) out.push(pktLine('NAK\n'));
+      // stateless HTTP negotiation: always NAK, never 'ready' (the client then sends 'done')
+      out.push(pktLine('NAK\n'));
       out.push(FLUSH);
       return Buffer.concat(out);
     }
+    console.log('[git] fetchV2 wants=%j haves=%j done=%s depth=%s', wants, haves, done, depth);
     const result = this.objectsForSend(wants, haves, depth);
-    out.push(pktLine('acknowledgments\n'));
-    if (haves.length === 0 || !result.nothingNew) out.push(pktLine('NAK\n'));
-    else {
-      for (const h of haves.slice(-16)) if (this.store.has(h)) out.push(pktLine(`ack ${h}\n`));
+    const DELIM = Buffer.from('0001', 'ascii');
+    if (!done) {
+      out.push(pktLine('acknowledgments\n'));
+      if (depth !== null) {
+        // shallow boundaries go in the acknowledgments section
+        const pre = this.objectsForSend(wants, haves, depth);
+        for (const l of pre.shallowLines) out.push(pktLine(l + '\n'));
+        for (const l of pre.unshallowLines) out.push(pktLine(l + '\n'));
+      }
+      out.push(pktLine('NAK\n'));
+      out.push(FLUSH);
+      return Buffer.concat(out);
     }
-    out.push(pktLine('ready\n'));
-    out.push(FLUSH);
-    out.push(pktLine('shallow-info\n'));
-    for (const l of result.shallowLines) out.push(pktLine(l + '\n'));
-    out.push(FLUSH);
+    if (result.shallowLines.length > 0) {
+      out.push(pktLine('shallow-info\n'));
+      for (const l of result.shallowLines) out.push(pktLine(l + '\n'));
+      out.push(DELIM);
+    }
     out.push(pktLine('packfile\n'));
     const pack = buildPack(result.objects);
+    console.log('[git] pack n=%d size=%d', result.objects.length, pack.length);
     out.push(sideband(pack, 1));
     return Buffer.concat(out);
   }
