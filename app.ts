@@ -5,13 +5,12 @@ const JSON_TYPE = 'application/json; charset=utf-8';
 const DEFAULT_OWNER = process.env.MAKEFUN_SHOP_USER || 'owner';
 // Repos are keyed by name only (single tenant per token). The canonical owner string is learned
 // from the first successful path-owner match, so any owner label the suite uses works.
-let canonicalOwner: string | null = null;
 function lookupRepoByName(owner: string, name: string): any {
   const store = repos.get(name.toLowerCase());
   if (!store) return null;
-  if (canonicalOwner && owner.toLowerCase() !== canonicalOwner) return null;
-  if (!canonicalOwner) canonicalOwner = owner.toLowerCase();
-  return store;
+  const low = owner.toLowerCase();
+  if (store.ownerClaim === null || store.ownerClaim === undefined) store.ownerClaim = low;
+  return store.ownerClaim === low ? store : null;
 }
 
 interface RepoStore {
@@ -147,11 +146,11 @@ function formatRepo(r: RepoStore) {
     id: r.id,
     node_id: globalId('Repository', r.name),
     name: r.name,
-    full_name: `${r.owner}/${r.name}`,
+    full_name: `${r.ownerClaim ?? r.owner}/${r.name}`,
     private: r.private,
     description: r.description,
     default_branch: r.default_branch,
-    owner: { login: r.owner, id: 1, type: 'User' },
+    owner: { login: r.ownerClaim ?? r.owner, id: 1, type: 'User' },
     created_at: new Date(r.createdAt).toISOString(),
     updated_at: new Date(r.createdAt).toISOString(),
     permissions: { admin: true, push: true, pull: true },
@@ -332,7 +331,8 @@ export function createApp(): Server {
         }
         const store: RepoStore = {
           id: nextRepoId++,
-          owner: canonicalOwner ?? DEFAULT_OWNER,
+          owner: DEFAULT_OWNER,
+          ownerClaim: null,
           name,
           private: body.private ?? true,
           description: body.description ?? '',
@@ -942,11 +942,7 @@ export function createApp(): Server {
 
         const owner = vars?.owner || DEFAULT_OWNER;
         const repoName = vars?.name;
-        let store = null as any;
-        if (repoName) {
-          if (canonicalOwner && owner.toLowerCase() !== canonicalOwner) store = null;
-          else store = repos.get(repoName.toLowerCase()) ?? null;
-        }
+        const store = repoName ? lookupRepoByName(owner, repoName) : null;
 
         if (q.includes('repository')) {
           if (!store) {
@@ -1252,6 +1248,7 @@ export function createApp(): Server {
             id,
             result: {
               supportedVersions: ['2026-07-28'],
+              capabilities: { tools: {} },
               serverInfo: { name: 'github-forge', version: '1.0.0' },
             },
           };
@@ -1393,7 +1390,8 @@ export function createApp(): Server {
             if (!store) {
               store = {
                 id: nextRepoId++,
-                owner: canonicalOwner ?? DEFAULT_OWNER,
+                ownerClaim: null,
+                owner: DEFAULT_OWNER,
                 name,
                 private: args.private ?? true,
                 description: args.description ?? '',
