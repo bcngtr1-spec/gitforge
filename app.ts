@@ -30,7 +30,7 @@ interface RepoStore {
   files: Map<string, { content: string; sha: string; size: number; commitSha: string }>;
   git?: any;
   branches: Map<string, string>; // branchName -> commitSha
-  commits: Array<{ sha: string; message: string; branch: string; author: string; timestamp: number; filePath?: string }>;
+  commits: Array<{ sha: string; message: string; branch: string; author: string; timestamp: number; filePath?: string; paths?: string[] }>;
   labels: Map<string, { name: string; color: string }>;
   issues: Map<number, {
     number: number;
@@ -136,6 +136,46 @@ function hashString(str: string): string {
 
 function globalId(type: string, id: string | number): string {
   return Buffer.from(`${type}:${id}`).toString('base64');
+}
+
+/** Compute changed file paths of a commit by diffing its tree against the first parent's tree. */
+function diffTreePaths(git: any, commitSha: string): string[] {
+  const treeEntries = (treeSha: string, prefix: string, out: Map<string, string>): void => {
+    const t = git.store.get(treeSha);
+    if (!t || t.type !== 'tree') return;
+    let p = 0;
+    while (p < t.data.length) {
+      const nul = t.data.indexOf(0, p);
+      if (nul < 0) break;
+      const meta = t.data.slice(p, nul).toString('utf8');
+      const sp = meta.indexOf(32);
+      const mode = meta.slice(0, sp);
+      const name = meta.slice(sp + 1);
+      const sha = t.data.slice(nul + 1, nul + 21).toString('hex');
+      p = nul + 21;
+      const path = prefix ? `${prefix}/${name}` : name;
+      if (mode.startsWith('40')) treeEntries(sha, path, out);
+      else if (mode !== '160000') out.set(path, sha);
+    }
+  };
+  const obj = git.store.get(commitSha);
+  if (!obj || obj.type !== 'commit') return [];
+  const text = obj.data.toString('utf8');
+  const tm = /^tree ([0-9a-f]{40})/m.exec(text);
+  const pm = [...text.matchAll(/^parent ([0-9a-f]{40})/gm)];
+  const mine = new Map<string, string>();
+  if (tm) treeEntries(tm[1], '', mine);
+  if (pm.length === 0) return [...mine.keys()];
+  const parent = new Map<string, string>();
+  const pobj = git.store.get(pm[0][1]);
+  if (pobj && pobj.type === 'commit') {
+    const ptm = /^tree ([0-9a-f]{40})/m.exec(pobj.data.toString('utf8'));
+    if (ptm) treeEntries(ptm[1], '', parent);
+  }
+  const changed: string[] = [];
+  for (const [k, v] of mine) if (parent.get(k) !== v) changed.push(k);
+  for (const k of parent.keys()) if (!mine.has(k)) changed.push(k);
+  return changed;
 }
 
 function parseGlobalId(globalIdStr: string): { type: string; id: string | number } | null {
@@ -281,7 +321,10 @@ export function createApp(): Server {
                 const msg = /^\n?([^\n]*)/.exec(text.slice(text.indexOf('\n\n') + 2))?.[1] ?? '';
                 const existing = store.commits.find((c) => c.sha === newSha);
                 const branchName = ref.slice(11);
-                if (!existing) store.commits.push({ sha: newSha, message: msg || 'commit', branch: branchName, author: 'git', timestamp: Date.now(), filePath: undefined });
+                if (!existing) {
+                  const changed = diffTreePaths(git, newSha);
+                  store.commits.push({ sha: newSha, message: msg || 'commit', branch: branchName, author: 'git', timestamp: Date.now(), filePath: undefined, paths: changed });
+                }
               }
             }
           }
@@ -665,8 +708,8 @@ export function createApp(): Server {
           const baseSha = store.branches.get(baseRef) || hashString(baseRef);
           const num = store.nextPullNumber++;
           const changedPaths = store.commits
-            .filter((c) => c.branch === headRef && c.filePath)
-            .map((c) => c.filePath as string);
+            .filter((c) => c.branch === headRef)
+            .flatMap((c) => (c.paths ?? (c.filePath ? [c.filePath] : [])));
           const prObj = {
             number: num,
             title,
@@ -1192,8 +1235,8 @@ export function createApp(): Server {
               id: globalId('PullRequest', num),
               createdAt: Date.now(),
               changedFiles: [...new Set(targetStore.commits
-                .filter((c) => c.branch === (input.headRefName || 'feature') && c.filePath)
-                .map((c) => c.filePath as string))],
+                .filter((c) => c.branch === (input.headRefName || 'feature'))
+                .flatMap((c) => (c.paths ?? (c.filePath ? [c.filePath] : []))))],
             };
             targetStore.pulls.set(num, prObj);
             data.createPullRequest = {
