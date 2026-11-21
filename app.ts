@@ -250,7 +250,7 @@ export function createApp(): Server {
         for await (const chunk of req) bodyChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
         const body = Buffer.concat(bodyChunks);
         const isV2 = String(req.headers['git-protocol'] ?? '').includes('version=2');
-        res.setHeader('content-type', 'application/x-git-upload-pack-result');
+        res.setHeader('content-type', subPath === '/git-receive-pack' ? 'application/x-git-receive-pack-result' : 'application/x-git-upload-pack-result');
         res.setHeader('cache-control', 'no-cache, max-age=0, must-revalidate');
         res.writeHead(200);
         if (subPath === '/ls-refs') {
