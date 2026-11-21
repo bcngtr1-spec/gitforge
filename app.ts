@@ -1100,7 +1100,7 @@ export function createApp(): Server {
                 for (const r of repos.values()) {
                   if (r.name === parsed.id || String(r.id) === String(parsed.id)) {
                     data.node = {
-                      id: r.id,
+                      id: globalId('Repository', r.name),
                       name: r.name,
                       nameWithOwner: `${r.ownerClaim ?? r.owner}/${r.name}`,
                     };
@@ -1191,6 +1191,9 @@ export function createApp(): Server {
               base: { ref: input.baseRefName || targetStore.default_branch, sha: '2222222222222222222222222222222222222222' },
               id: globalId('PullRequest', num),
               createdAt: Date.now(),
+              changedFiles: [...new Set(targetStore.commits
+                .filter((c) => c.branch === (input.headRefName || 'feature') && c.filePath)
+                .map((c) => c.filePath as string))],
             };
             targetStore.pulls.set(num, prObj);
             data.createPullRequest = {
