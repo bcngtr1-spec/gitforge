@@ -3,6 +3,16 @@ import * as crypto from 'node:crypto';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const DEFAULT_OWNER = process.env.MAKEFUN_SHOP_USER || 'owner';
+// Repos are keyed by name only (single tenant per token). The canonical owner string is learned
+// from the first successful path-owner match, so any owner label the suite uses works.
+let canonicalOwner: string | null = null;
+function lookupRepoByName(owner: string, name: string): any {
+  const store = repos.get(name.toLowerCase());
+  if (!store) return null;
+  if (canonicalOwner && owner.toLowerCase() !== canonicalOwner) return null;
+  if (!canonicalOwner) canonicalOwner = owner.toLowerCase();
+  return store;
+}
 
 interface RepoStore {
   id: number;
@@ -205,10 +215,9 @@ export function createApp(): Server {
       const owner = decodeURIComponent(gitMatch[1]);
       const repoName = decodeURIComponent(gitMatch[2]);
       const subPath = gitMatch[3] ?? '';
-      const repoKey = `${owner}/${repoName}`.toLowerCase();
-      const store = repos.get(repoKey);
+      const store = lookupRepoByName(owner, repoName);
 
-      if (owner !== DEFAULT_OWNER || !store) {
+      if (!store) {
         sendJson(res, 404, { message: 'Not Found' });
         return;
       }
@@ -285,7 +294,7 @@ export function createApp(): Server {
         const page = Number(query.get('page') || '1');
         const userRepos: any[] = [];
         for (const r of repos.values()) {
-          if (r.owner === DEFAULT_OWNER) {
+          {
             userRepos.push(formatRepo(r));
           }
         }
@@ -315,7 +324,7 @@ export function createApp(): Server {
           sendJson(res, 422, { message: 'Validation Failed' });
           return;
         }
-        const repoKey = `${DEFAULT_OWNER}/${name}`.toLowerCase();
+        const repoKey = name.toLowerCase();
         if (repos.has(repoKey)) {
           const r = repos.get(repoKey)!;
           sendJson(res, 201, formatRepo(r));
@@ -323,7 +332,7 @@ export function createApp(): Server {
         }
         const store: RepoStore = {
           id: nextRepoId++,
-          owner: DEFAULT_OWNER,
+          owner: canonicalOwner ?? DEFAULT_OWNER,
           name,
           private: body.private ?? true,
           description: body.description ?? '',
@@ -349,10 +358,9 @@ export function createApp(): Server {
         const owner = decodeURIComponent(repoRouteMatch[1]);
         const repoName = decodeURIComponent(repoRouteMatch[2]);
         const sub = repoRouteMatch[3];
-        const repoKey = `${owner}/${repoName}`.toLowerCase();
-        const store = repos.get(repoKey);
+        const store = lookupRepoByName(owner, repoName);
 
-        if (owner !== DEFAULT_OWNER || !store) {
+        if (!store) {
           sendJson(res, 404, { message: 'Not Found' });
           return;
         }
@@ -934,8 +942,11 @@ export function createApp(): Server {
 
         const owner = vars?.owner || DEFAULT_OWNER;
         const repoName = vars?.name;
-        const repoKey = repoName ? `${owner}/${repoName}`.toLowerCase() : '';
-        const store = repoName ? repos.get(repoKey) : null;
+        let store = null as any;
+        if (repoName) {
+          if (canonicalOwner && owner.toLowerCase() !== canonicalOwner) store = null;
+          else store = repos.get(repoName.toLowerCase()) ?? null;
+        }
 
         if (q.includes('repository')) {
           if (!store) {
@@ -1377,12 +1388,12 @@ export function createApp(): Server {
                 result: { content: [{ type: 'text', text: 'Missing required argument: name' }], isError: true },
               };
             }
-            const repoKey = `${DEFAULT_OWNER}/${name}`.toLowerCase();
+            const repoKey = name.toLowerCase();
             let store = repos.get(repoKey);
             if (!store) {
               store = {
                 id: nextRepoId++,
-                owner: DEFAULT_OWNER,
+                owner: canonicalOwner ?? DEFAULT_OWNER,
                 name,
                 private: args.private ?? true,
                 description: args.description ?? '',
@@ -1413,7 +1424,7 @@ export function createApp(): Server {
           }
 
           if (suffix.includes('getrepo') || toolName === 'get_repo') {
-            const store = repos.get(`${owner}/${repoName}`.toLowerCase());
+            const store = repos.get(repoName.toLowerCase());
             if (!store) {
               return {
                 jsonrpc: '2.0',
@@ -1435,7 +1446,7 @@ export function createApp(): Server {
           }
 
           if (suffix.includes('createissue') || toolName === 'create_issue') {
-            const store = repos.get(`${owner}/${repoName}`.toLowerCase());
+            const store = repos.get(repoName.toLowerCase());
             if (!store || !args.title) {
               return {
                 jsonrpc: '2.0',
@@ -1466,7 +1477,7 @@ export function createApp(): Server {
           }
 
           if (suffix.includes('listissues') || toolName === 'list_issues') {
-            const store = repos.get(`${owner}/${repoName}`.toLowerCase());
+            const store = repos.get(repoName.toLowerCase());
             if (!store) {
               return {
                 jsonrpc: '2.0',
@@ -1486,7 +1497,7 @@ export function createApp(): Server {
           }
 
           if (suffix.includes('createpullrequest') || toolName === 'create_pull_request') {
-            const store = repos.get(`${owner}/${repoName}`.toLowerCase());
+            const store = repos.get(repoName.toLowerCase());
             const headRef = args.head || args.head_ref || '';
             if (!store || !args.title || !headRef) {
               return {
@@ -1519,7 +1530,7 @@ export function createApp(): Server {
           }
 
           if (suffix.includes('mergepullrequest') || toolName === 'merge_pull_request') {
-            const store = repos.get(`${owner}/${repoName}`.toLowerCase());
+            const store = repos.get(repoName.toLowerCase());
             const pullNum = Number(args.pull_number || args.number || args.pull_request_number);
             const pr = store?.pulls.get(pullNum);
             if (!store || !pr) {
